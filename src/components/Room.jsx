@@ -15,8 +15,9 @@ export default function Room({ userConfig, onLeaveRoom }) {
   const [copied, setCopied] = useState(false);
   const [messages, setMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
-  const [remotePeers, setRemotePeers] = useState(new Map()); // socketId -> { stream, name, avatar, micOn, videoOn }
+  const [remotePeers, setRemotePeers] = useState(new Map());
   const [mediaError, setMediaError] = useState(null);
+  const [myPeerId, setMyPeerId] = useState(null);
 
   const socketRef = useRef(null);
   const peerRef = useRef(null);
@@ -25,169 +26,208 @@ export default function Room({ userConfig, onLeaveRoom }) {
   const callsRef = useRef(new Map());
 
   useEffect(() => {
-    // 1. Initialize Socket.io Connection
-    const socket = io(window.location.origin, {
-      transports: ['websocket', 'polling']
-    });
-    socketRef.current = socket;
+    let isSubscribed = true;
 
-    // 2. Initialize PeerJS Peer
-    const peer = new Peer({
-      config: {
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' },
-          { urls: 'stun:global.stun.twilio.com:3478' },
-          {
-            urls: [
-              'turn:openrelay.metered.ca:80',
-              'turn:openrelay.metered.ca:443',
-              'turn:openrelay.metered.ca:443?transport=tcp'
-            ],
-            username: 'openrelay',
-            credential: 'openrelay'
-          }
-        ]
-      }
-    });
-    peerRef.current = peer;
-
-    async function initUserMedia() {
+    async function startVideoApp() {
+      // 1. Get Local Stream FIRST
+      let localStream;
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
+        localStream = await navigator.mediaDevices.getUserMedia({
           video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
           audio: { echoCancellation: true, noiseSuppression: true }
         });
-
-        localStreamRef.current = stream;
-        stream.getAudioTracks().forEach(t => { t.enabled = initialMic; });
-        stream.getVideoTracks().forEach(t => { t.enabled = initialVideo; });
-
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream;
+      } catch (err) {
+        console.warn('Camera/Mic permission error:', err);
+        if (isSubscribed) {
+          setMediaError('Could not access Camera or Microphone. Please allow browser permissions.');
         }
+        localStream = new MediaStream();
+      }
 
-        // When PeerJS ID is generated, join room
-        peer.on('open', (peerId) => {
-          console.log('[PeerJS] Registered ID:', peerId);
-          socket.emit('join-room', {
-            roomId,
-            userName,
-            avatar,
-            peerId,
-            micOn: initialMic,
-            videoOn: initialVideo
-          });
-        });
+      if (!isSubscribed) return;
 
-        // Answer incoming calls
-        peer.on('call', (call) => {
-          console.log('[PeerJS] Answering call from:', call.peer);
-          call.answer(stream);
+      localStreamRef.current = localStream;
+      localStream.getAudioTracks().forEach(t => { t.enabled = initialMic; });
+      localStream.getVideoTracks().forEach(t => { t.enabled = initialVideo; });
 
-          call.on('stream', (remoteStream) => {
-            console.log('[PeerJS] Received remote stream from:', call.peer);
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = localStream;
+      }
+
+      // 2. Initialize PeerJS SECOND with guaranteed Stream
+      const peer = new Peer({
+        config: {
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:global.stun.twilio.com:3478' },
+            {
+              urls: [
+                'turn:openrelay.metered.ca:80',
+                'turn:openrelay.metered.ca:443',
+                'turn:openrelay.metered.ca:443?transport=tcp'
+              ],
+              username: 'openrelay',
+              credential: 'openrelay'
+            }
+          ]
+        }
+      });
+      peerRef.current = peer;
+
+      // Handle incoming calls reliably
+      peer.on('call', (call) => {
+        console.log('[PeerJS] Answering call from:', call.peer);
+        call.answer(localStreamRef.current);
+
+        call.on('stream', (remoteStream) => {
+          console.log('[PeerJS] Remote stream received:', call.peer);
+          if (isSubscribed) {
             setRemotePeers(prev => {
               const updated = new Map(prev);
               const existing = updated.get(call.peer) || {};
               return updated.set(call.peer, { ...existing, stream: remoteStream, peerId: call.peer });
             });
-          });
-
-          callsRef.current.set(call.peer, call);
+          }
         });
 
-      } catch (err) {
-        console.error('Camera/Mic permission error:', err);
-        setMediaError('Could not access Camera or Microphone. Please allow browser permissions.');
-      }
-    }
+        callsRef.current.set(call.peer, call);
+      });
 
-    initUserMedia();
+      // 3. Connect Socket.io THIRD once Peer ID is ready
+      peer.on('open', (peerId) => {
+        console.log('[PeerJS] Peer ID ready:', peerId);
+        if (isSubscribed) setMyPeerId(peerId);
 
-    // 3. Socket Event Handlers
-    socket.on('room-users', (existingUsers) => {
-      existingUsers.forEach(user => {
-        if (user.peerId && localStreamRef.current) {
-          console.log('[PeerJS] Calling existing user:', user.peerId);
-          const call = peer.call(user.peerId, localStreamRef.current);
-          
-          call.on('stream', (remoteStream) => {
-            console.log('[PeerJS] Stream received from existing user:', user.peerId);
+        const socket = io(window.location.origin, {
+          transports: ['websocket', 'polling']
+        });
+        socketRef.current = socket;
+
+        socket.emit('join-room', {
+          roomId,
+          userName,
+          avatar,
+          peerId,
+          micOn: initialMic,
+          videoOn: initialVideo
+        });
+
+        socket.on('room-users', (existingUsers) => {
+          existingUsers.forEach(user => {
+            if (user.peerId && user.peerId !== peerId) {
+              console.log('[PeerJS] Calling existing user:', user.peerId);
+              const call = peer.call(user.peerId, localStreamRef.current);
+              
+              call.on('stream', (remoteStream) => {
+                console.log('[PeerJS] Stream received from existing user:', user.peerId);
+                if (isSubscribed) {
+                  setRemotePeers(prev => {
+                    const updated = new Map(prev);
+                    return updated.set(user.peerId, { 
+                      stream: remoteStream, 
+                      name: user.name, 
+                      avatar: user.avatar,
+                      peerId: user.peerId,
+                      micOn: user.micOn,
+                      videoOn: user.videoOn 
+                    });
+                  });
+                }
+              });
+
+              callsRef.current.set(user.peerId, call);
+            }
+          });
+        });
+
+        socket.on('user-joined', (newUser) => {
+          if (newUser.peerId && newUser.peerId !== peerId) {
+            console.log('[PeerJS] User joined room:', newUser.name, newUser.peerId);
             setRemotePeers(prev => {
               const updated = new Map(prev);
-              return updated.set(user.peerId, { 
-                stream: remoteStream, 
-                name: user.name, 
-                avatar: user.avatar,
-                peerId: user.peerId,
-                micOn: user.micOn,
-                videoOn: user.videoOn 
+              const existing = updated.get(newUser.peerId) || {};
+              return updated.set(newUser.peerId, {
+                ...existing,
+                name: newUser.name,
+                avatar: newUser.avatar,
+                peerId: newUser.peerId,
+                micOn: newUser.micOn,
+                videoOn: newUser.videoOn
               });
             });
-          });
 
-          callsRef.current.set(user.peerId, call);
-        }
-      });
-    });
-
-    socket.on('user-joined', (newUser) => {
-      setRemotePeers(prev => {
-        const updated = new Map(prev);
-        return updated.set(newUser.peerId, {
-          name: newUser.name,
-          avatar: newUser.avatar,
-          peerId: newUser.peerId,
-          micOn: newUser.micOn,
-          videoOn: newUser.videoOn
-        });
-      });
-    });
-
-    socket.on('room-chat-history', (history) => {
-      if (Array.isArray(history)) setMessages(history);
-    });
-
-    socket.on('new-message', (msg) => {
-      setMessages(prev => [...prev, msg]);
-    });
-
-    socket.on('user-media-toggled', ({ socketId, micOn, videoOn }) => {
-      setRemotePeers(prev => {
-        const updated = new Map(prev);
-        for (let [pId, pData] of updated.entries()) {
-          if (pData.socketId === socketId) {
-            updated.set(pId, { ...pData, micOn, videoOn });
-          }
-        }
-        return updated;
-      });
-    });
-
-    socket.on('user-left', ({ socketId }) => {
-      setRemotePeers(prev => {
-        const updated = new Map(prev);
-        for (let [pId, pData] of updated.entries()) {
-          if (pData.socketId === socketId) {
-            if (callsRef.current.has(pId)) {
-              callsRef.current.get(pId).close();
-              callsRef.current.delete(pId);
+            // 2-way call fallback
+            if (!callsRef.current.has(newUser.peerId)) {
+              console.log('[PeerJS] Fallback calling newUser:', newUser.peerId);
+              const call = peer.call(newUser.peerId, localStreamRef.current);
+              call.on('stream', (remoteStream) => {
+                if (isSubscribed) {
+                  setRemotePeers(prev => {
+                    const updated = new Map(prev);
+                    const existing = updated.get(newUser.peerId) || {};
+                    return updated.set(newUser.peerId, { ...existing, stream: remoteStream, peerId: newUser.peerId });
+                  });
+                }
+              });
+              callsRef.current.set(newUser.peerId, call);
             }
-            updated.delete(pId);
           }
-        }
-        return updated;
+        });
+
+        socket.on('room-chat-history', (history) => {
+          if (Array.isArray(history) && isSubscribed) setMessages(history);
+        });
+
+        socket.on('new-message', (msg) => {
+          if (isSubscribed) setMessages(prev => [...prev, msg]);
+        });
+
+        socket.on('user-media-toggled', ({ socketId, micOn, videoOn }) => {
+          if (isSubscribed) {
+            setRemotePeers(prev => {
+              const updated = new Map(prev);
+              for (let [pId, pData] of updated.entries()) {
+                if (pData.socketId === socketId) {
+                  updated.set(pId, { ...pData, micOn, videoOn });
+                }
+              }
+              return updated;
+            });
+          }
+        });
+
+        socket.on('user-left', ({ socketId }) => {
+          if (isSubscribed) {
+            setRemotePeers(prev => {
+              const updated = new Map(prev);
+              for (let [pId, pData] of updated.entries()) {
+                if (pData.socketId === socketId) {
+                  if (callsRef.current.has(pId)) {
+                    callsRef.current.get(pId).close();
+                    callsRef.current.delete(pId);
+                  }
+                  updated.delete(pId);
+                }
+              }
+              return updated;
+            });
+          }
+        });
+
       });
-    });
+    }
+
+    startVideoApp();
 
     return () => {
+      isSubscribed = false;
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach(t => t.stop());
       }
       callsRef.current.forEach(call => call.close());
-      peer.destroy();
-      socket.disconnect();
+      if (peerRef.current) peerRef.current.destroy();
+      if (socketRef.current) socketRef.current.disconnect();
     };
   }, [roomId]);
 
@@ -242,7 +282,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
             <h2 className="font-bold text-white text-sm flex items-center gap-2">
               OmniCall Room <span className="px-2 py-0.5 rounded-md bg-pink-500/20 text-pink-300 font-mono text-xs border border-pink-500/30">{roomId}</span>
             </h2>
-            <p className="text-[10px] text-pink-200/70">PeerJS Direct HD Stream</p>
+            <p className="text-[10px] text-pink-200/70">PeerJS HD Stream • 2-Way Sync</p>
           </div>
         </div>
 
@@ -307,11 +347,15 @@ export default function Room({ userConfig, onLeaveRoom }) {
             </div>
           )}
 
-          {/* Picture-in-Picture LOCAL VIDEO (Floating top-right or bottom-right) */}
+          {/* Picture-in-Picture LOCAL VIDEO */}
           <div className="absolute bottom-4 right-4 w-36 sm:w-56 aspect-[3/4] sm:aspect-video rounded-2xl glass-panel overflow-hidden border-2 border-pink-500/50 shadow-2xl z-20 bg-slate-950">
             {videoOn ? (
               <video
-                ref={localVideoRef}
+                ref={(el) => {
+                  if (el && localStreamRef.current && el.srcObject !== localStreamRef.current) {
+                    el.srcObject = localStreamRef.current;
+                  }
+                }}
                 autoPlay
                 playsInline
                 muted
@@ -372,7 +416,6 @@ export default function Room({ userConfig, onLeaveRoom }) {
       {/* Simplified Controls Toolbar */}
       <footer className="p-4 flex items-center justify-center gap-3 z-30">
         
-        {/* Mic Toggle */}
         <button
           onClick={handleToggleMic}
           className={`p-3.5 rounded-2xl transition-all ${
@@ -383,7 +426,6 @@ export default function Room({ userConfig, onLeaveRoom }) {
           {micOn ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5" />}
         </button>
 
-        {/* Video Toggle */}
         <button
           onClick={handleToggleVideo}
           className={`p-3.5 rounded-2xl transition-all ${
@@ -394,7 +436,6 @@ export default function Room({ userConfig, onLeaveRoom }) {
           {videoOn ? <Video className="w-5 h-5" /> : <VideoOff className="w-5 h-5" />}
         </button>
 
-        {/* Chat Toggle */}
         <button
           onClick={() => setShowChat(!showChat)}
           className={`p-3.5 rounded-2xl transition-all ${
@@ -405,7 +446,6 @@ export default function Room({ userConfig, onLeaveRoom }) {
           <MessageSquare className="w-5 h-5" />
         </button>
 
-        {/* Leave Call */}
         <button
           onClick={onLeaveRoom}
           className="p-3.5 rounded-2xl bg-rose-600 hover:bg-rose-700 text-white font-bold transition-all shadow-lg shadow-rose-600/40 ml-2"
@@ -420,44 +460,46 @@ export default function Room({ userConfig, onLeaveRoom }) {
   );
 }
 
-// Ultra Simple Peer Video Tile with Guaranteed Autoplay
+// Ultra Robust Peer Video Tile with React DOM Callback Ref Attachment
 function PeerVideoTile({ peerData }) {
-  const videoRef = useRef(null);
-  const audioRef = useRef(null);
-
-  useEffect(() => {
-    if (peerData.stream) {
-      if (videoRef.current) {
-        videoRef.current.srcObject = peerData.stream;
-        videoRef.current.play().catch(console.warn);
-      }
-      if (audioRef.current) {
-        audioRef.current.srcObject = peerData.stream;
-        audioRef.current.play().catch(console.warn);
-      }
-    }
-  }, [peerData.stream]);
-
   return (
     <div className="relative w-full aspect-video rounded-3xl glass-panel overflow-hidden border border-white/15 shadow-2xl bg-[#110721] flex items-center justify-center border-pink-500/30">
-      <audio ref={audioRef} autoPlay playsInline />
+      
+      {/* Audio Element for voice */}
+      <audio
+        ref={(el) => {
+          if (el && peerData.stream && el.srcObject !== peerData.stream) {
+            el.srcObject = peerData.stream;
+            el.play().catch(console.warn);
+          }
+        }}
+        autoPlay
+        playsInline
+      />
 
+      {/* Video Element for 2-way stream */}
       {peerData.stream ? (
         <video
-          ref={videoRef}
+          ref={(el) => {
+            if (el && peerData.stream && el.srcObject !== peerData.stream) {
+              el.srcObject = peerData.stream;
+              el.play().catch(console.warn);
+            }
+          }}
           autoPlay
           playsInline
           muted
           className="w-full h-full object-cover"
         />
       ) : (
-        <div className="flex flex-col items-center justify-center gap-3">
+        <div className="flex flex-col items-center justify-center gap-3 p-4">
           <img
             src={peerData.avatar || `https://api.dicebear.com/7.x/bottts/svg?seed=${peerData.peerId}`}
             alt={peerData.name || 'User'}
-            className="w-20 h-20 rounded-full p-1 bg-slate-900 border border-pink-500/40"
+            className="w-20 h-20 rounded-full p-1 bg-slate-900 border border-pink-500/40 shadow-lg"
           />
-          <span className="text-xs text-pink-200 font-medium">{peerData.name || 'Participant'}</span>
+          <span className="text-xs text-pink-200 font-semibold">{peerData.name || 'Connecting...'}</span>
+          <span className="text-[10px] text-pink-300/60 animate-pulse">Connecting HD Video Stream...</span>
         </div>
       )}
 
