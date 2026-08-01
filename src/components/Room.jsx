@@ -1,12 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
-import Peer from 'peerjs';
 import { 
   Mic, MicOff, Video, VideoOff, MessageSquare, 
   PhoneOff, Share2, Copy, Check, ShieldCheck, Users, Radio, AlertCircle, RefreshCw, Smartphone
 } from 'lucide-react';
 
-// Multi-Protocol TURN Relay for Mobile Cellular (CGNAT) <-> PC Wi-Fi Cross-Connectivity
 const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -37,48 +35,38 @@ export default function Room({ userConfig, onLeaveRoom }) {
   const [copied, setCopied] = useState(false);
   const [messages, setMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
-  const [remotePeers, setRemotePeers] = useState(new Map());
+  const [participants, setParticipants] = useState([]);
+  const [remoteStreams, setRemoteStreams] = useState(new Map()); // socketId -> MediaStream
   const [mediaError, setMediaError] = useState(null);
 
   const socketRef = useRef(null);
-  const peerRef = useRef(null);
   const localStreamRef = useRef(null);
   const localVideoRef = useRef(null);
-  const callsRef = useRef(new Map());
+  const peersRef = useRef(new Map()); // socketId -> RTCPeerConnection
+  const candidateQueues = useRef(new Map()); // socketId -> RTCIceCandidate[]
 
   useEffect(() => {
-    let isSubscribed = true;
+    const socket = io(window.location.origin, {
+      transports: ['websocket', 'polling']
+    });
+    socketRef.current = socket;
 
-    async function startMobilePCVideoApp() {
-      // 1. Get Local Stream with Mobile & PC Cross-Compatible Constraints
+    async function initNativeWebRTC() {
       let localStream;
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: { ideal: 1280, max: 1920 },
-            height: { ideal: 720, max: 1080 },
-            frameRate: { ideal: 30 }
-          },
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true
-          }
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+          audio: { echoCancellation: true, noiseSuppression: true }
         });
       } catch (err) {
-        console.warn('Camera/Mic permission error:', err);
-        // Fallback for mobile devices if ideal resolution constraint is strict
+        console.warn('Strict resolution failed, trying basic getUserMedia:', err);
         try {
           localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         } catch (e) {
-          if (isSubscribed) {
-            setMediaError('Could not access Camera or Microphone. Please allow browser permissions.');
-          }
+          setMediaError('Could not access Camera or Microphone. Please allow browser permissions.');
           localStream = new MediaStream();
         }
       }
-
-      if (!isSubscribed) return;
 
       localStreamRef.current = localStream;
       localStream.getAudioTracks().forEach(t => { t.enabled = initialMic; });
@@ -88,167 +76,204 @@ export default function Room({ userConfig, onLeaveRoom }) {
         localVideoRef.current.srcObject = localStream;
       }
 
-      // 2. Initialize PeerJS with Mobile CGNAT TURN Config
-      const peer = new Peer({
-        config: ICE_SERVERS,
-        debug: 1
-      });
-      peerRef.current = peer;
-
-      // Handle incoming call with stream
-      peer.on('call', (call) => {
-        console.log('[PeerJS] Incoming cross-device call from:', call.peer);
-        call.answer(localStreamRef.current);
-
-        call.on('stream', (remoteStream) => {
-          console.log('[PeerJS] Received remote stream from:', call.peer);
-          if (isSubscribed) {
-            setRemotePeers(prev => {
-              const updated = new Map(prev);
-              const existing = updated.get(call.peer) || {};
-              return updated.set(call.peer, { ...existing, stream: remoteStream, peerId: call.peer });
-            });
-          }
-        });
-
-        callsRef.current.set(call.peer, call);
+      // Join room via Socket.io
+      socket.emit('join-room', {
+        roomId,
+        userName,
+        avatar,
+        micOn: initialMic,
+        videoOn: initialVideo
       });
 
-      // 3. Connect Socket.io after Peer ID is generated
-      peer.on('open', (peerId) => {
-        console.log('[PeerJS] Peer ID ready:', peerId);
+      // Handlers
+      socket.on('room-users', (users) => {
+        console.log('[Socket] Existing room users:', users);
+        setParticipants([
+          { socketId: socket.id, name: userName, avatar, micOn: initialMic, videoOn: initialVideo },
+          ...users
+        ]);
 
-        const socket = io(window.location.origin, {
-          transports: ['websocket', 'polling']
+        // Initiate WebRTC connection to each existing user
+        users.forEach(user => {
+          createOfferToUser(user.socketId);
         });
-        socketRef.current = socket;
+      });
 
-        socket.emit('join-room', {
-          roomId,
-          userName,
-          avatar,
-          peerId,
-          micOn: initialMic,
-          videoOn: initialVideo
+      socket.on('user-joined', (newUser) => {
+        console.log('[Socket] New user joined:', newUser);
+        setParticipants(prev => [...prev.filter(p => p.socketId !== newUser.socketId), newUser]);
+      });
+
+      socket.on('offer', async ({ from, offer }) => {
+        console.log('[WebRTC] Received offer from:', from);
+        await handleReceiveOffer(from, offer);
+      });
+
+      socket.on('answer', async ({ from, answer }) => {
+        console.log('[WebRTC] Received answer from:', from);
+        await handleReceiveAnswer(from, answer);
+      });
+
+      socket.on('ice-candidate', async ({ from, candidate }) => {
+        await handleReceiveCandidate(from, candidate);
+      });
+
+      socket.on('room-chat-history', (history) => {
+        if (Array.isArray(history)) setMessages(history);
+      });
+
+      socket.on('new-message', (msg) => {
+        setMessages(prev => [...prev, msg]);
+      });
+
+      socket.on('user-media-toggled', ({ socketId, micOn, videoOn }) => {
+        setParticipants(prev => prev.map(p => p.socketId === socketId ? { ...p, micOn, videoOn } : p));
+      });
+
+      socket.on('user-left', ({ socketId }) => {
+        if (peersRef.current.has(socketId)) {
+          peersRef.current.get(socketId).close();
+          peersRef.current.delete(socketId);
+        }
+        candidateQueues.current.delete(socketId);
+        setRemoteStreams(prev => {
+          const next = new Map(prev);
+          next.delete(socketId);
+          return next;
         });
-
-        socket.on('room-users', (existingUsers) => {
-          existingUsers.forEach(user => {
-            if (user.peerId && user.peerId !== peerId) {
-              console.log('[PeerJS] Calling user:', user.peerId);
-              const call = peer.call(user.peerId, localStreamRef.current);
-              
-              call.on('stream', (remoteStream) => {
-                console.log('[PeerJS] Stream received from existing user:', user.peerId);
-                if (isSubscribed) {
-                  setRemotePeers(prev => {
-                    const updated = new Map(prev);
-                    return updated.set(user.peerId, { 
-                      stream: remoteStream, 
-                      name: user.name, 
-                      avatar: user.avatar,
-                      peerId: user.peerId,
-                      micOn: user.micOn,
-                      videoOn: user.videoOn 
-                    });
-                  });
-                }
-              });
-
-              callsRef.current.set(user.peerId, call);
-            }
-          });
-        });
-
-        socket.on('user-joined', (newUser) => {
-          if (newUser.peerId && newUser.peerId !== peerId) {
-            console.log('[PeerJS] User joined room:', newUser.name, newUser.peerId);
-            setRemotePeers(prev => {
-              const updated = new Map(prev);
-              const existing = updated.get(newUser.peerId) || {};
-              return updated.set(newUser.peerId, {
-                ...existing,
-                name: newUser.name,
-                avatar: newUser.avatar,
-                peerId: newUser.peerId,
-                micOn: newUser.micOn,
-                videoOn: newUser.videoOn
-              });
-            });
-
-            // 2-Way call fallback for Mobile <-> PC
-            if (!callsRef.current.has(newUser.peerId)) {
-              console.log('[PeerJS] Initiating call to newUser:', newUser.peerId);
-              const call = peer.call(newUser.peerId, localStreamRef.current);
-              call.on('stream', (remoteStream) => {
-                if (isSubscribed) {
-                  setRemotePeers(prev => {
-                    const updated = new Map(prev);
-                    const existing = updated.get(newUser.peerId) || {};
-                    return updated.set(newUser.peerId, { ...existing, stream: remoteStream, peerId: newUser.peerId });
-                  });
-                }
-              });
-              callsRef.current.set(newUser.peerId, call);
-            }
-          }
-        });
-
-        socket.on('room-chat-history', (history) => {
-          if (Array.isArray(history) && isSubscribed) setMessages(history);
-        });
-
-        socket.on('new-message', (msg) => {
-          if (isSubscribed) setMessages(prev => [...prev, msg]);
-        });
-
-        socket.on('user-media-toggled', ({ socketId, micOn, videoOn }) => {
-          if (isSubscribed) {
-            setRemotePeers(prev => {
-              const updated = new Map(prev);
-              for (let [pId, pData] of updated.entries()) {
-                if (pData.socketId === socketId) {
-                  updated.set(pId, { ...pData, micOn, videoOn });
-                }
-              }
-              return updated;
-            });
-          }
-        });
-
-        socket.on('user-left', ({ socketId }) => {
-          if (isSubscribed) {
-            setRemotePeers(prev => {
-              const updated = new Map(prev);
-              for (let [pId, pData] of updated.entries()) {
-                if (pData.socketId === socketId) {
-                  if (callsRef.current.has(pId)) {
-                    callsRef.current.get(pId).close();
-                    callsRef.current.delete(pId);
-                  }
-                  updated.delete(pId);
-                }
-              }
-              return updated;
-            });
-          }
-        });
-
+        setParticipants(prev => prev.filter(p => p.socketId !== socketId));
       });
     }
 
-    startMobilePCVideoApp();
+    initNativeWebRTC();
 
     return () => {
-      isSubscribed = false;
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach(t => t.stop());
       }
-      callsRef.current.forEach(call => call.close());
-      if (peerRef.current) peerRef.current.destroy();
-      if (socketRef.current) socketRef.current.disconnect();
+      peersRef.current.forEach(peer => peer.close());
+      socket.disconnect();
     };
   }, [roomId]);
+
+  // WEBRTC HELPER FUNCTIONS
+  function createPeer(targetSocketId) {
+    if (peersRef.current.has(targetSocketId)) {
+      return peersRef.current.get(targetSocketId);
+    }
+
+    console.log('[WebRTC] Creating RTCPeerConnection for:', targetSocketId);
+    const peer = new RTCPeerConnection(ICE_SERVERS);
+
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => {
+        peer.addTrack(track, localStreamRef.current);
+      });
+    }
+
+    peer.onicecandidate = (event) => {
+      if (event.candidate) {
+        socketRef.current?.emit('ice-candidate', {
+          to: targetSocketId,
+          candidate: event.candidate
+        });
+      }
+    };
+
+    peer.ontrack = (event) => {
+      console.log('[WebRTC] Received remote track from:', targetSocketId, event.track.kind);
+      const incomingStream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream([event.track]);
+      
+      setRemoteStreams(prev => {
+        const next = new Map(prev);
+        const existingStream = next.get(targetSocketId) || new MediaStream();
+        if (!existingStream.getTracks().some(t => t.id === event.track.id)) {
+          existingStream.addTrack(event.track);
+        }
+        return next.set(targetSocketId, existingStream);
+      });
+    };
+
+    peer.onconnectionstatechange = () => {
+      console.log(`[WebRTC] Connection state with ${targetSocketId}:`, peer.connectionState);
+      if (peer.connectionState === 'failed' || peer.connectionState === 'disconnected') {
+        try { peer.restartIce(); } catch (e) {}
+      }
+    };
+
+    peersRef.current.set(targetSocketId, peer);
+    return peer;
+  }
+
+  async function createOfferToUser(targetSocketId) {
+    const peer = createPeer(targetSocketId);
+    try {
+      const offer = await peer.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+      await peer.setLocalDescription(offer);
+      socketRef.current?.emit('offer', { to: targetSocketId, offer });
+    } catch (err) {
+      console.error('[WebRTC] Offer error:', err);
+    }
+  }
+
+  async function handleReceiveOffer(fromSocketId, offerSignal) {
+    const peer = createPeer(fromSocketId);
+    try {
+      await peer.setRemoteDescription(new RTCSessionDescription(offerSignal));
+
+      // Flush queued candidates
+      if (candidateQueues.current.has(fromSocketId)) {
+        const candidates = candidateQueues.current.get(fromSocketId);
+        for (const candidate of candidates) {
+          await peer.addIceCandidate(candidate);
+        }
+        candidateQueues.current.delete(fromSocketId);
+      }
+
+      const answer = await peer.createAnswer();
+      await peer.setLocalDescription(answer);
+      socketRef.current?.emit('answer', { to: fromSocketId, answer });
+    } catch (err) {
+      console.error('[WebRTC] Handle offer error:', err);
+    }
+  }
+
+  async function handleReceiveAnswer(fromSocketId, answerSignal) {
+    const peer = peersRef.current.get(fromSocketId);
+    if (peer) {
+      try {
+        await peer.setRemoteDescription(new RTCSessionDescription(answerSignal));
+
+        if (candidateQueues.current.has(fromSocketId)) {
+          const candidates = candidateQueues.current.get(fromSocketId);
+          for (const candidate of candidates) {
+            await peer.addIceCandidate(candidate);
+          }
+          candidateQueues.current.delete(fromSocketId);
+        }
+      } catch (err) {
+        console.error('[WebRTC] Handle answer error:', err);
+      }
+    }
+  }
+
+  async function handleReceiveCandidate(fromSocketId, candidateData) {
+    const peer = peersRef.current.get(fromSocketId);
+    const candidate = new RTCIceCandidate(candidateData);
+
+    if (peer && peer.remoteDescription && peer.remoteDescription.type) {
+      try {
+        await peer.addIceCandidate(candidate);
+      } catch (e) {
+        console.warn('ICE Candidate add error:', e);
+      }
+    } else {
+      if (!candidateQueues.current.has(fromSocketId)) {
+        candidateQueues.current.set(fromSocketId, []);
+      }
+      candidateQueues.current.get(fromSocketId).push(candidate);
+    }
+  }
 
   // Toggle Mic
   const handleToggleMic = () => {
@@ -278,7 +303,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
     setChatInput('');
   };
 
-  // Copy Room Link
+  // Copy Link
   const handleCopyLink = () => {
     const link = `${window.location.origin}/?room=${roomId}`;
     navigator.clipboard.writeText(link);
@@ -286,7 +311,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const remotePeersList = Array.from(remotePeers.values());
+  const remoteUsers = participants.filter(p => p.socketId !== socketRef.current?.id);
 
   return (
     <div className="relative h-screen w-screen bg-[#090314] flex flex-col overflow-hidden text-slate-100 font-['Plus_Jakarta_Sans',sans-serif]">
@@ -301,7 +326,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
             <h2 className="font-bold text-white text-sm flex items-center gap-2">
               OmniCall Room <span className="px-2 py-0.5 rounded-md bg-pink-500/20 text-pink-300 font-mono text-xs border border-pink-500/30">{roomId}</span>
             </h2>
-            <p className="text-[10px] text-pink-200/70">Mobile 4G/5G <span className="text-pink-400">↔</span> PC HD Ready</p>
+            <p className="text-[10px] text-pink-200/70">Native WebRTC • Socket.io Relay</p>
           </div>
         </div>
 
@@ -316,7 +341,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
         </div>
       </header>
 
-      {/* Permission Warning */}
+      {/* Permission Error Banner */}
       {mediaError && (
         <div className="bg-pink-500/20 border-b border-pink-500/40 px-4 py-2 text-pink-200 text-xs flex items-center justify-between z-40">
           <div className="flex items-center gap-2">
@@ -332,21 +357,20 @@ export default function Room({ userConfig, onLeaveRoom }) {
         </div>
       )}
 
-      {/* Main Video View Area */}
+      {/* Main Video View */}
       <div className="flex-1 flex overflow-hidden relative p-3 md:p-6">
         
-        {/* Remote Video (Full Container) or Split Grid */}
         <div className="flex-1 flex items-center justify-center relative">
           
-          {remotePeersList.length === 0 ? (
+          {remoteUsers.length === 0 ? (
             /* Waiting State */
             <div className="w-full max-w-2xl aspect-video rounded-3xl glass-panel border border-white/15 shadow-2xl flex flex-col items-center justify-center gap-4 p-8 text-center bg-[#110721]/80">
               <div className="p-4 bg-pink-500/20 rounded-full border border-pink-500/40 animate-pulse">
                 <Users className="w-10 h-10 text-pink-400" />
               </div>
               <div>
-                <h3 className="text-xl font-extrabold text-white">Waiting for participant...</h3>
-                <p className="text-xs text-pink-200/70 mt-1">Share Room Code <strong className="text-pink-400">{roomId}</strong> to connect Mobile or PC!</p>
+                <h3 className="text-xl font-extrabold text-white">Waiting for someone to join...</h3>
+                <p className="text-xs text-pink-200/70 mt-1">Share Room Code <strong className="text-pink-400">{roomId}</strong> or copy link to start call!</p>
               </div>
               <button
                 onClick={handleCopyLink}
@@ -356,13 +380,20 @@ export default function Room({ userConfig, onLeaveRoom }) {
               </button>
             </div>
           ) : (
-            /* Render Remote Streams Grid */
+            /* Render Remote Streams */
             <div className={`w-full h-full grid gap-4 ${
-              remotePeersList.length === 1 ? 'grid-cols-1 max-w-4xl' : 'grid-cols-1 sm:grid-cols-2 max-w-6xl'
+              remoteUsers.length === 1 ? 'grid-cols-1 max-w-4xl' : 'grid-cols-1 sm:grid-cols-2 max-w-6xl'
             } items-center justify-center mx-auto`}>
-              {remotePeersList.map((peerData) => (
-                <PeerVideoTile key={peerData.peerId} peerData={peerData} />
-              ))}
+              {remoteUsers.map((user) => {
+                const stream = remoteStreams.get(user.socketId);
+                return (
+                  <NativeVideoTile
+                    key={user.socketId}
+                    user={user}
+                    stream={stream}
+                  />
+                );
+              })}
             </div>
           )}
 
@@ -394,7 +425,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
 
         </div>
 
-        {/* Side Chat Drawer */}
+        {/* Side Chat */}
         {showChat && (
           <div className="w-72 md:w-80 h-full glass-panel border-l border-white/15 flex flex-col shadow-2xl z-40 animate-slide-in">
             <div className="p-4 border-b border-white/10 flex items-center justify-between font-bold text-white text-sm">
@@ -433,7 +464,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
 
       </div>
 
-      {/* Controls Toolbar */}
+      {/* Controls */}
       <footer className="p-4 flex items-center justify-center gap-3 z-30">
         
         <button
@@ -480,16 +511,16 @@ export default function Room({ userConfig, onLeaveRoom }) {
   );
 }
 
-// Peer Video Tile with Mobile Safari / Android WebKit PlaysInline Compatibility
-function PeerVideoTile({ peerData }) {
+// Native Video Tile Component with Guaranteed Stream Attachment
+function NativeVideoTile({ user, stream }) {
   return (
     <div className="relative w-full aspect-video rounded-3xl glass-panel overflow-hidden border border-white/15 shadow-2xl bg-[#110721] flex items-center justify-center border-pink-500/30">
       
-      {/* Audio Element for voice */}
+      {/* Voice Audio Element */}
       <audio
         ref={(el) => {
-          if (el && peerData.stream && el.srcObject !== peerData.stream) {
-            el.srcObject = peerData.stream;
+          if (el && stream && el.srcObject !== stream) {
+            el.srcObject = stream;
             el.play().catch(console.warn);
           }
         }}
@@ -498,12 +529,12 @@ function PeerVideoTile({ peerData }) {
         webkit-playsinline="true"
       />
 
-      {/* Video Element for 2-way stream */}
-      {peerData.stream ? (
+      {/* Video Element */}
+      {user.videoOn && stream ? (
         <video
           ref={(el) => {
-            if (el && peerData.stream && el.srcObject !== peerData.stream) {
-              el.srcObject = peerData.stream;
+            if (el && stream && el.srcObject !== stream) {
+              el.srcObject = stream;
               el.play().catch(console.warn);
             }
           }}
@@ -516,17 +547,16 @@ function PeerVideoTile({ peerData }) {
       ) : (
         <div className="flex flex-col items-center justify-center gap-3 p-4">
           <img
-            src={peerData.avatar || `https://api.dicebear.com/7.x/bottts/svg?seed=${peerData.peerId}`}
-            alt={peerData.name || 'User'}
+            src={user.avatar || `https://api.dicebear.com/7.x/bottts/svg?seed=${user.socketId}`}
+            alt={user.name || 'User'}
             className="w-20 h-20 rounded-full p-1 bg-slate-900 border border-pink-500/40 shadow-lg"
           />
-          <span className="text-xs text-pink-200 font-semibold">{peerData.name || 'Connecting...'}</span>
-          <span className="text-[10px] text-pink-300/60 animate-pulse">Connecting Mobile ↔ PC Stream...</span>
+          <span className="text-xs text-pink-200 font-semibold">{user.name || 'Participant'}</span>
         </div>
       )}
 
       <div className="absolute bottom-3 left-3 px-3 py-1 rounded-xl glass-panel border border-white/15 text-xs font-bold text-white flex items-center gap-1.5">
-        <span>{peerData.name || 'Participant'}</span>
+        <span>{user.name || 'Participant'}</span>
         <Smartphone className="w-3.5 h-3.5 text-pink-400" />
       </div>
     </div>

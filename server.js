@@ -65,7 +65,21 @@ io.on('connection', (socket) => {
     console.log(`[Room ${roomId}] User ${currentUser.name} (${socket.id}) joined.`);
   });
 
-  // Signal routing (Offer, Answer, ICE Candidates)
+  // Native WebRTC Signal Routing (Offer, Answer, ICE Candidates)
+  socket.on('offer', ({ to, offer }) => {
+    console.log(`[Signal] Offer from ${socket.id} to ${to}`);
+    io.to(to).emit('offer', { from: socket.id, offer });
+  });
+
+  socket.on('answer', ({ to, answer }) => {
+    console.log(`[Signal] Answer from ${socket.id} to ${to}`);
+    io.to(to).emit('answer', { from: socket.id, answer });
+  });
+
+  socket.on('ice-candidate', ({ to, candidate }) => {
+    io.to(to).emit('ice-candidate', { from: socket.id, candidate });
+  });
+
   socket.on('sending-signal', ({ to, signal, fromUser }) => {
     io.to(to).emit('user-signal', {
       signal,
