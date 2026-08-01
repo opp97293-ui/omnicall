@@ -3,8 +3,30 @@ import { io } from 'socket.io-client';
 import Peer from 'peerjs';
 import { 
   Mic, MicOff, Video, VideoOff, MessageSquare, 
-  PhoneOff, Share2, Copy, Check, ShieldCheck, Users, Radio, AlertCircle, RefreshCw
+  PhoneOff, Share2, Copy, Check, ShieldCheck, Users, Radio, AlertCircle, RefreshCw, Smartphone
 } from 'lucide-react';
+
+// Multi-Protocol TURN Relay for Mobile Cellular (CGNAT) <-> PC Wi-Fi Cross-Connectivity
+const ICE_SERVERS = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' },
+    { urls: 'stun:global.stun.twilio.com:3478' },
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+        'turns:openrelay.metered.ca:443?transport=tcp'
+      ],
+      username: 'openrelay',
+      credential: 'openrelay'
+    }
+  ]
+};
 
 export default function Room({ userConfig, onLeaveRoom }) {
   const { roomId, userName, avatar, micOn: initialMic, videoOn: initialVideo } = userConfig;
@@ -17,7 +39,6 @@ export default function Room({ userConfig, onLeaveRoom }) {
   const [chatInput, setChatInput] = useState('');
   const [remotePeers, setRemotePeers] = useState(new Map());
   const [mediaError, setMediaError] = useState(null);
-  const [myPeerId, setMyPeerId] = useState(null);
 
   const socketRef = useRef(null);
   const peerRef = useRef(null);
@@ -28,20 +49,33 @@ export default function Room({ userConfig, onLeaveRoom }) {
   useEffect(() => {
     let isSubscribed = true;
 
-    async function startVideoApp() {
-      // 1. Get Local Stream FIRST
+    async function startMobilePCVideoApp() {
+      // 1. Get Local Stream with Mobile & PC Cross-Compatible Constraints
       let localStream;
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-          audio: { echoCancellation: true, noiseSuppression: true }
+          video: {
+            width: { ideal: 1280, max: 1920 },
+            height: { ideal: 720, max: 1080 },
+            frameRate: { ideal: 30 }
+          },
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
         });
       } catch (err) {
         console.warn('Camera/Mic permission error:', err);
-        if (isSubscribed) {
-          setMediaError('Could not access Camera or Microphone. Please allow browser permissions.');
+        // Fallback for mobile devices if ideal resolution constraint is strict
+        try {
+          localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        } catch (e) {
+          if (isSubscribed) {
+            setMediaError('Could not access Camera or Microphone. Please allow browser permissions.');
+          }
+          localStream = new MediaStream();
         }
-        localStream = new MediaStream();
       }
 
       if (!isSubscribed) return;
@@ -54,34 +88,20 @@ export default function Room({ userConfig, onLeaveRoom }) {
         localVideoRef.current.srcObject = localStream;
       }
 
-      // 2. Initialize PeerJS SECOND with guaranteed Stream
+      // 2. Initialize PeerJS with Mobile CGNAT TURN Config
       const peer = new Peer({
-        config: {
-          iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'stun:global.stun.twilio.com:3478' },
-            {
-              urls: [
-                'turn:openrelay.metered.ca:80',
-                'turn:openrelay.metered.ca:443',
-                'turn:openrelay.metered.ca:443?transport=tcp'
-              ],
-              username: 'openrelay',
-              credential: 'openrelay'
-            }
-          ]
-        }
+        config: ICE_SERVERS,
+        debug: 1
       });
       peerRef.current = peer;
 
-      // Handle incoming calls reliably
+      // Handle incoming call with stream
       peer.on('call', (call) => {
-        console.log('[PeerJS] Answering call from:', call.peer);
+        console.log('[PeerJS] Incoming cross-device call from:', call.peer);
         call.answer(localStreamRef.current);
 
         call.on('stream', (remoteStream) => {
-          console.log('[PeerJS] Remote stream received:', call.peer);
+          console.log('[PeerJS] Received remote stream from:', call.peer);
           if (isSubscribed) {
             setRemotePeers(prev => {
               const updated = new Map(prev);
@@ -94,10 +114,9 @@ export default function Room({ userConfig, onLeaveRoom }) {
         callsRef.current.set(call.peer, call);
       });
 
-      // 3. Connect Socket.io THIRD once Peer ID is ready
+      // 3. Connect Socket.io after Peer ID is generated
       peer.on('open', (peerId) => {
         console.log('[PeerJS] Peer ID ready:', peerId);
-        if (isSubscribed) setMyPeerId(peerId);
 
         const socket = io(window.location.origin, {
           transports: ['websocket', 'polling']
@@ -116,7 +135,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
         socket.on('room-users', (existingUsers) => {
           existingUsers.forEach(user => {
             if (user.peerId && user.peerId !== peerId) {
-              console.log('[PeerJS] Calling existing user:', user.peerId);
+              console.log('[PeerJS] Calling user:', user.peerId);
               const call = peer.call(user.peerId, localStreamRef.current);
               
               call.on('stream', (remoteStream) => {
@@ -157,9 +176,9 @@ export default function Room({ userConfig, onLeaveRoom }) {
               });
             });
 
-            // 2-way call fallback
+            // 2-Way call fallback for Mobile <-> PC
             if (!callsRef.current.has(newUser.peerId)) {
-              console.log('[PeerJS] Fallback calling newUser:', newUser.peerId);
+              console.log('[PeerJS] Initiating call to newUser:', newUser.peerId);
               const call = peer.call(newUser.peerId, localStreamRef.current);
               call.on('stream', (remoteStream) => {
                 if (isSubscribed) {
@@ -218,7 +237,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
       });
     }
 
-    startVideoApp();
+    startMobilePCVideoApp();
 
     return () => {
       isSubscribed = false;
@@ -282,7 +301,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
             <h2 className="font-bold text-white text-sm flex items-center gap-2">
               OmniCall Room <span className="px-2 py-0.5 rounded-md bg-pink-500/20 text-pink-300 font-mono text-xs border border-pink-500/30">{roomId}</span>
             </h2>
-            <p className="text-[10px] text-pink-200/70">PeerJS HD Stream • 2-Way Sync</p>
+            <p className="text-[10px] text-pink-200/70">Mobile 4G/5G <span className="text-pink-400">↔</span> PC HD Ready</p>
           </div>
         </div>
 
@@ -320,14 +339,14 @@ export default function Room({ userConfig, onLeaveRoom }) {
         <div className="flex-1 flex items-center justify-center relative">
           
           {remotePeersList.length === 0 ? (
-            /* Waiting State when alone in room */
+            /* Waiting State */
             <div className="w-full max-w-2xl aspect-video rounded-3xl glass-panel border border-white/15 shadow-2xl flex flex-col items-center justify-center gap-4 p-8 text-center bg-[#110721]/80">
               <div className="p-4 bg-pink-500/20 rounded-full border border-pink-500/40 animate-pulse">
                 <Users className="w-10 h-10 text-pink-400" />
               </div>
               <div>
-                <h3 className="text-xl font-extrabold text-white">Waiting for someone to join...</h3>
-                <p className="text-xs text-pink-200/70 mt-1">Share the Room Code <strong className="text-pink-400">{roomId}</strong> or copy the link to invite your friend!</p>
+                <h3 className="text-xl font-extrabold text-white">Waiting for participant...</h3>
+                <p className="text-xs text-pink-200/70 mt-1">Share Room Code <strong className="text-pink-400">{roomId}</strong> to connect Mobile or PC!</p>
               </div>
               <button
                 onClick={handleCopyLink}
@@ -348,7 +367,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
           )}
 
           {/* Picture-in-Picture LOCAL VIDEO */}
-          <div className="absolute bottom-4 right-4 w-36 sm:w-56 aspect-[3/4] sm:aspect-video rounded-2xl glass-panel overflow-hidden border-2 border-pink-500/50 shadow-2xl z-20 bg-slate-950">
+          <div className="absolute bottom-4 right-4 w-32 sm:w-56 aspect-[3/4] sm:aspect-video rounded-2xl glass-panel overflow-hidden border-2 border-pink-500/50 shadow-2xl z-20 bg-slate-950">
             {videoOn ? (
               <video
                 ref={(el) => {
@@ -358,6 +377,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
                 }}
                 autoPlay
                 playsInline
+                webkit-playsinline="true"
                 muted
                 className="w-full h-full object-cover transform -scale-x-100"
               />
@@ -374,7 +394,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
 
         </div>
 
-        {/* Simple Side Chat Drawer */}
+        {/* Side Chat Drawer */}
         {showChat && (
           <div className="w-72 md:w-80 h-full glass-panel border-l border-white/15 flex flex-col shadow-2xl z-40 animate-slide-in">
             <div className="p-4 border-b border-white/10 flex items-center justify-between font-bold text-white text-sm">
@@ -413,7 +433,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
 
       </div>
 
-      {/* Simplified Controls Toolbar */}
+      {/* Controls Toolbar */}
       <footer className="p-4 flex items-center justify-center gap-3 z-30">
         
         <button
@@ -460,7 +480,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
   );
 }
 
-// Ultra Robust Peer Video Tile with React DOM Callback Ref Attachment
+// Peer Video Tile with Mobile Safari / Android WebKit PlaysInline Compatibility
 function PeerVideoTile({ peerData }) {
   return (
     <div className="relative w-full aspect-video rounded-3xl glass-panel overflow-hidden border border-white/15 shadow-2xl bg-[#110721] flex items-center justify-center border-pink-500/30">
@@ -475,6 +495,7 @@ function PeerVideoTile({ peerData }) {
         }}
         autoPlay
         playsInline
+        webkit-playsinline="true"
       />
 
       {/* Video Element for 2-way stream */}
@@ -488,6 +509,7 @@ function PeerVideoTile({ peerData }) {
           }}
           autoPlay
           playsInline
+          webkit-playsinline="true"
           muted
           className="w-full h-full object-cover"
         />
@@ -499,12 +521,13 @@ function PeerVideoTile({ peerData }) {
             className="w-20 h-20 rounded-full p-1 bg-slate-900 border border-pink-500/40 shadow-lg"
           />
           <span className="text-xs text-pink-200 font-semibold">{peerData.name || 'Connecting...'}</span>
-          <span className="text-[10px] text-pink-300/60 animate-pulse">Connecting HD Video Stream...</span>
+          <span className="text-[10px] text-pink-300/60 animate-pulse">Connecting Mobile ↔ PC Stream...</span>
         </div>
       )}
 
-      <div className="absolute bottom-3 left-3 px-3 py-1 rounded-xl glass-panel border border-white/15 text-xs font-bold text-white">
-        {peerData.name || 'Participant'}
+      <div className="absolute bottom-3 left-3 px-3 py-1 rounded-xl glass-panel border border-white/15 text-xs font-bold text-white flex items-center gap-1.5">
+        <span>{peerData.name || 'Participant'}</span>
+        <Smartphone className="w-3.5 h-3.5 text-pink-400" />
       </div>
     </div>
   );
