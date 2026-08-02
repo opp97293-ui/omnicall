@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
 import { 
   Mic, MicOff, Video, VideoOff, MessageSquare, 
-  PhoneOff, Share2, Copy, Check, ShieldCheck, Users, Radio, AlertCircle, RefreshCw, Smartphone, Activity
+  PhoneOff, Share2, Copy, Check, Users, Radio, AlertCircle, RefreshCw, Smartphone, Activity
 } from 'lucide-react';
 
 const ICE_SERVERS = {
@@ -36,8 +36,8 @@ export default function Room({ userConfig, onLeaveRoom }) {
   const [messages, setMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
   const [participants, setParticipants] = useState([]);
-  const [remoteStreams, setRemoteStreams] = useState(new Map()); // socketId -> MediaStream (NEW INSTANCE ON UPDATE)
-  const [connectionStates, setConnectionStates] = useState(new Map()); // socketId -> string ('connecting'|'connected'|'failed')
+  const [remoteStreams, setRemoteStreams] = useState(new Map()); // socketId -> MediaStream
+  const [connectionStates, setConnectionStates] = useState(new Map()); // socketId -> string
   const [mediaError, setMediaError] = useState(null);
 
   const socketRef = useRef(null);
@@ -52,7 +52,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
     });
     socketRef.current = socket;
 
-    async function initNativeWebRTC() {
+    async function initPerfectWebRTC() {
       let localStream;
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
@@ -60,7 +60,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
           audio: { echoCancellation: true, noiseSuppression: true }
         });
       } catch (err) {
-        console.warn('High-res constraints failed, trying basic getUserMedia:', err);
+        console.warn('Strict resolution failed, trying basic getUserMedia:', err);
         try {
           localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         } catch (e) {
@@ -88,28 +88,23 @@ export default function Room({ userConfig, onLeaveRoom }) {
       });
 
       // Handlers
-      socket.on('room-users', (users) => {
-        console.log('[Socket] Room users list received:', users);
+      socket.on('room-users', (existingUsers) => {
+        console.log('[Socket] Room users list received:', existingUsers);
         setParticipants([
           { socketId: socket.id, name: userName, avatar, micOn: initialMic, videoOn: initialVideo },
-          ...users
+          ...existingUsers
         ]);
 
-        users.forEach(user => {
+        // NEWLY JOINED USER ONLY initiates offers to existing users (Prevents Glare!)
+        existingUsers.forEach(user => {
           createOfferToUser(user.socketId);
         });
       });
 
       socket.on('user-joined', (newUser) => {
-        console.log('[Socket] New user joined:', newUser);
+        console.log('[Socket] New user joined room:', newUser);
         setParticipants(prev => [...prev.filter(p => p.socketId !== newUser.socketId), newUser]);
-        
-        // Ensure dual-side offer initiation
-        setTimeout(() => {
-          if (!peersRef.current.has(newUser.socketId)) {
-            createOfferToUser(newUser.socketId);
-          }
-        }, 500);
+        // Existing user DOES NOT create offer here; waits for joining user's offer!
       });
 
       socket.on('offer', async ({ from, offer }) => {
@@ -158,7 +153,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
       });
     }
 
-    initNativeWebRTC();
+    initPerfectWebRTC();
 
     return () => {
       if (localStreamRef.current) {
@@ -195,7 +190,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
       }
     };
 
-    // CRITICAL FIX: Always return a NEW MediaStream instance so React state updates trigger re-render!
+    // Return new MediaStream reference instance on every track update so React re-renders!
     peer.ontrack = (event) => {
       console.log('[WebRTC] Received remote track from:', targetSocketId, event.track.kind);
       
@@ -205,9 +200,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
         const hasTrack = existingTracks.some(t => t.id === event.track.id);
         const updatedTracks = hasTrack ? existingTracks : [...existingTracks, event.track];
         
-        // Return brand new MediaStream object instance
-        const newStream = new MediaStream(updatedTracks);
-        return new Map(prev).set(targetSocketId, newStream);
+        return new Map(prev).set(targetSocketId, new MediaStream(updatedTracks));
       });
     };
 
@@ -215,8 +208,8 @@ export default function Room({ userConfig, onLeaveRoom }) {
       console.log(`[WebRTC] ICE Connection State (${targetSocketId}):`, peer.iceConnectionState);
       setConnectionStates(prev => new Map(prev).set(targetSocketId, peer.iceConnectionState));
 
-      if (peer.iceConnectionState === 'failed' || peer.iceConnectionState === 'disconnected') {
-        console.warn(`[WebRTC] ICE connection ${peer.iceConnectionState}. Restarting ICE...`);
+      if (peer.iceConnectionState === 'failed') {
+        console.warn(`[WebRTC] ICE connection failed. Restarting ICE...`);
         try { peer.restartIce(); } catch (e) {}
       }
     };
@@ -247,6 +240,12 @@ export default function Room({ userConfig, onLeaveRoom }) {
   async function handleReceiveOffer(fromSocketId, offerSignal) {
     const peer = createPeer(fromSocketId);
     try {
+      // If we are already in have-local-offer state, ignore duplicate offer or rollback
+      if (peer.signalingState !== 'stable') {
+        console.warn(`[WebRTC] Ignore offer from ${fromSocketId} because signalingState is ${peer.signalingState}`);
+        return;
+      }
+
       await peer.setRemoteDescription(new RTCSessionDescription(offerSignal));
 
       // Flush candidate queue
@@ -270,14 +269,19 @@ export default function Room({ userConfig, onLeaveRoom }) {
     const peer = peersRef.current.get(fromSocketId);
     if (peer) {
       try {
-        await peer.setRemoteDescription(new RTCSessionDescription(answerSignal));
+        // STRICT CHECK: Only call setRemoteDescription if state is have-local-offer (Fixes InvalidStateError!)
+        if (peer.signalingState === 'have-local-offer') {
+          await peer.setRemoteDescription(new RTCSessionDescription(answerSignal));
 
-        if (candidateQueues.current.has(fromSocketId)) {
-          const candidates = candidateQueues.current.get(fromSocketId);
-          for (const candidate of candidates) {
-            await peer.addIceCandidate(candidate);
+          if (candidateQueues.current.has(fromSocketId)) {
+            const candidates = candidateQueues.current.get(fromSocketId);
+            for (const candidate of candidates) {
+              await peer.addIceCandidate(candidate);
+            }
+            candidateQueues.current.delete(fromSocketId);
           }
-          candidateQueues.current.delete(fromSocketId);
+        } else {
+          console.warn(`[WebRTC] Safely ignoring answer from ${fromSocketId} because signalingState is ${peer.signalingState}`);
         }
       } catch (err) {
         console.error('[WebRTC] Handle answer error:', err);
@@ -354,7 +358,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
             <h2 className="font-bold text-white text-sm flex items-center gap-2">
               OmniCall Room <span className="px-2 py-0.5 rounded-md bg-pink-500/20 text-pink-300 font-mono text-xs border border-pink-500/30">{roomId}</span>
             </h2>
-            <p className="text-[10px] text-pink-200/70">Native WebRTC • 2-Way React Stream Fix</p>
+            <p className="text-[10px] text-pink-200/70">Native WebRTC • Glare-Free Perfect Signaling</p>
           </div>
         </div>
 
@@ -541,7 +545,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
   );
 }
 
-// ALWAYS-MOUNTED Video Tile Component (Prevents Unmount/Re-mount Stream Drop)
+// ALWAYS-MOUNTED Video Tile Component
 function NativeVideoTile({ user, stream, connState }) {
   const videoRef = useRef(null);
   const audioRef = useRef(null);
@@ -570,7 +574,7 @@ function NativeVideoTile({ user, stream, connState }) {
   return (
     <div className="relative w-full aspect-video rounded-3xl glass-panel overflow-hidden border border-white/15 shadow-2xl bg-[#110721] flex items-center justify-center border-pink-500/30">
       
-      {/* Voice Audio Element - Always mounted */}
+      {/* Voice Audio Element */}
       <audio
         ref={audioRef}
         autoPlay
@@ -578,7 +582,7 @@ function NativeVideoTile({ user, stream, connState }) {
         webkit-playsinline="true"
       />
 
-      {/* Video Element - ALWAYS MOUNTED to prevent React DOM unmount stream drops */}
+      {/* Video Element - ALWAYS MOUNTED */}
       <video
         ref={videoRef}
         autoPlay
