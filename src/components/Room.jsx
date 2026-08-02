@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
 import { 
   Mic, MicOff, Video, VideoOff, MessageSquare, 
-  PhoneOff, Share2, Copy, Check, ShieldCheck, Users, Radio, AlertCircle, RefreshCw, Smartphone
+  PhoneOff, Share2, Copy, Check, ShieldCheck, Users, Radio, AlertCircle, RefreshCw, Smartphone, Activity
 } from 'lucide-react';
 
 const ICE_SERVERS = {
@@ -36,7 +36,8 @@ export default function Room({ userConfig, onLeaveRoom }) {
   const [messages, setMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
   const [participants, setParticipants] = useState([]);
-  const [remoteStreams, setRemoteStreams] = useState(new Map()); // socketId -> MediaStream
+  const [remoteStreams, setRemoteStreams] = useState(new Map()); // socketId -> MediaStream (NEW INSTANCE ON UPDATE)
+  const [connectionStates, setConnectionStates] = useState(new Map()); // socketId -> string ('connecting'|'connected'|'failed')
   const [mediaError, setMediaError] = useState(null);
 
   const socketRef = useRef(null);
@@ -59,10 +60,11 @@ export default function Room({ userConfig, onLeaveRoom }) {
           audio: { echoCancellation: true, noiseSuppression: true }
         });
       } catch (err) {
-        console.warn('Strict resolution failed, trying basic getUserMedia:', err);
+        console.warn('High-res constraints failed, trying basic getUserMedia:', err);
         try {
           localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         } catch (e) {
+          console.error('Camera/Mic permission error:', e);
           setMediaError('Could not access Camera or Microphone. Please allow browser permissions.');
           localStream = new MediaStream();
         }
@@ -87,13 +89,12 @@ export default function Room({ userConfig, onLeaveRoom }) {
 
       // Handlers
       socket.on('room-users', (users) => {
-        console.log('[Socket] Existing room users:', users);
+        console.log('[Socket] Room users list received:', users);
         setParticipants([
           { socketId: socket.id, name: userName, avatar, micOn: initialMic, videoOn: initialVideo },
           ...users
         ]);
 
-        // Initiate WebRTC connection to each existing user
         users.forEach(user => {
           createOfferToUser(user.socketId);
         });
@@ -102,6 +103,13 @@ export default function Room({ userConfig, onLeaveRoom }) {
       socket.on('user-joined', (newUser) => {
         console.log('[Socket] New user joined:', newUser);
         setParticipants(prev => [...prev.filter(p => p.socketId !== newUser.socketId), newUser]);
+        
+        // Ensure dual-side offer initiation
+        setTimeout(() => {
+          if (!peersRef.current.has(newUser.socketId)) {
+            createOfferToUser(newUser.socketId);
+          }
+        }, 500);
       });
 
       socket.on('offer', async ({ from, offer }) => {
@@ -141,6 +149,11 @@ export default function Room({ userConfig, onLeaveRoom }) {
           next.delete(socketId);
           return next;
         });
+        setConnectionStates(prev => {
+          const next = new Map(prev);
+          next.delete(socketId);
+          return next;
+        });
         setParticipants(prev => prev.filter(p => p.socketId !== socketId));
       });
     }
@@ -156,17 +169,19 @@ export default function Room({ userConfig, onLeaveRoom }) {
     };
   }, [roomId]);
 
-  // WEBRTC HELPER FUNCTIONS
+  // WEBRTC PEER CONNECTION CREATOR
   function createPeer(targetSocketId) {
     if (peersRef.current.has(targetSocketId)) {
       return peersRef.current.get(targetSocketId);
     }
 
-    console.log('[WebRTC] Creating RTCPeerConnection for:', targetSocketId);
+    console.log('[WebRTC] Creating RTCPeerConnection for target:', targetSocketId);
     const peer = new RTCPeerConnection(ICE_SERVERS);
 
+    // Add local tracks
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(track => {
+        console.log('[WebRTC] Adding local track to peer:', track.kind);
         peer.addTrack(track, localStreamRef.current);
       });
     }
@@ -180,25 +195,35 @@ export default function Room({ userConfig, onLeaveRoom }) {
       }
     };
 
+    // CRITICAL FIX: Always return a NEW MediaStream instance so React state updates trigger re-render!
     peer.ontrack = (event) => {
       console.log('[WebRTC] Received remote track from:', targetSocketId, event.track.kind);
-      const incomingStream = (event.streams && event.streams[0]) ? event.streams[0] : new MediaStream([event.track]);
       
       setRemoteStreams(prev => {
-        const next = new Map(prev);
-        const existingStream = next.get(targetSocketId) || new MediaStream();
-        if (!existingStream.getTracks().some(t => t.id === event.track.id)) {
-          existingStream.addTrack(event.track);
-        }
-        return next.set(targetSocketId, existingStream);
+        const prevStream = prev.get(targetSocketId);
+        const existingTracks = prevStream ? prevStream.getTracks() : [];
+        const hasTrack = existingTracks.some(t => t.id === event.track.id);
+        const updatedTracks = hasTrack ? existingTracks : [...existingTracks, event.track];
+        
+        // Return brand new MediaStream object instance
+        const newStream = new MediaStream(updatedTracks);
+        return new Map(prev).set(targetSocketId, newStream);
       });
     };
 
-    peer.onconnectionstatechange = () => {
-      console.log(`[WebRTC] Connection state with ${targetSocketId}:`, peer.connectionState);
-      if (peer.connectionState === 'failed' || peer.connectionState === 'disconnected') {
+    peer.oniceconnectionstatechange = () => {
+      console.log(`[WebRTC] ICE Connection State (${targetSocketId}):`, peer.iceConnectionState);
+      setConnectionStates(prev => new Map(prev).set(targetSocketId, peer.iceConnectionState));
+
+      if (peer.iceConnectionState === 'failed' || peer.iceConnectionState === 'disconnected') {
+        console.warn(`[WebRTC] ICE connection ${peer.iceConnectionState}. Restarting ICE...`);
         try { peer.restartIce(); } catch (e) {}
       }
+    };
+
+    peer.onconnectionstatechange = () => {
+      console.log(`[WebRTC] Peer Connection State (${targetSocketId}):`, peer.connectionState);
+      setConnectionStates(prev => new Map(prev).set(targetSocketId, peer.connectionState));
     };
 
     peersRef.current.set(targetSocketId, peer);
@@ -208,11 +233,14 @@ export default function Room({ userConfig, onLeaveRoom }) {
   async function createOfferToUser(targetSocketId) {
     const peer = createPeer(targetSocketId);
     try {
-      const offer = await peer.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+      const offer = await peer.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: true
+      });
       await peer.setLocalDescription(offer);
       socketRef.current?.emit('offer', { to: targetSocketId, offer });
     } catch (err) {
-      console.error('[WebRTC] Offer error:', err);
+      console.error('[WebRTC] Create offer error:', err);
     }
   }
 
@@ -221,7 +249,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
     try {
       await peer.setRemoteDescription(new RTCSessionDescription(offerSignal));
 
-      // Flush queued candidates
+      // Flush candidate queue
       if (candidateQueues.current.has(fromSocketId)) {
         const candidates = candidateQueues.current.get(fromSocketId);
         for (const candidate of candidates) {
@@ -326,7 +354,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
             <h2 className="font-bold text-white text-sm flex items-center gap-2">
               OmniCall Room <span className="px-2 py-0.5 rounded-md bg-pink-500/20 text-pink-300 font-mono text-xs border border-pink-500/30">{roomId}</span>
             </h2>
-            <p className="text-[10px] text-pink-200/70">Native WebRTC • Socket.io Relay</p>
+            <p className="text-[10px] text-pink-200/70">Native WebRTC • 2-Way React Stream Fix</p>
           </div>
         </div>
 
@@ -380,17 +408,19 @@ export default function Room({ userConfig, onLeaveRoom }) {
               </button>
             </div>
           ) : (
-            /* Render Remote Streams */
+            /* Render Remote Streams Grid */
             <div className={`w-full h-full grid gap-4 ${
               remoteUsers.length === 1 ? 'grid-cols-1 max-w-4xl' : 'grid-cols-1 sm:grid-cols-2 max-w-6xl'
             } items-center justify-center mx-auto`}>
               {remoteUsers.map((user) => {
                 const stream = remoteStreams.get(user.socketId);
+                const connState = connectionStates.get(user.socketId) || 'connecting';
                 return (
                   <NativeVideoTile
                     key={user.socketId}
                     user={user}
                     stream={stream}
+                    connState={connState}
                   />
                 );
               })}
@@ -511,51 +541,73 @@ export default function Room({ userConfig, onLeaveRoom }) {
   );
 }
 
-// Native Video Tile Component with Guaranteed Stream Attachment
-function NativeVideoTile({ user, stream }) {
+// ALWAYS-MOUNTED Video Tile Component (Prevents Unmount/Re-mount Stream Drop)
+function NativeVideoTile({ user, stream, connState }) {
+  const videoRef = useRef(null);
+  const audioRef = useRef(null);
+  const [hasVideoTrack, setHasVideoTrack] = useState(false);
+
+  useEffect(() => {
+    if (stream) {
+      const vTracks = stream.getVideoTracks();
+      setHasVideoTrack(vTracks.length > 0 && vTracks.some(t => t.enabled));
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.play().catch(e => console.warn('Video play catch:', e));
+      }
+      if (audioRef.current) {
+        audioRef.current.srcObject = stream;
+        audioRef.current.play().catch(e => console.warn('Audio play catch:', e));
+      }
+    } else {
+      setHasVideoTrack(false);
+    }
+  }, [stream, user.videoOn]);
+
+  const showVideo = stream && hasVideoTrack && user.videoOn !== false;
+
   return (
     <div className="relative w-full aspect-video rounded-3xl glass-panel overflow-hidden border border-white/15 shadow-2xl bg-[#110721] flex items-center justify-center border-pink-500/30">
       
-      {/* Voice Audio Element */}
+      {/* Voice Audio Element - Always mounted */}
       <audio
-        ref={(el) => {
-          if (el && stream && el.srcObject !== stream) {
-            el.srcObject = stream;
-            el.play().catch(console.warn);
-          }
-        }}
+        ref={audioRef}
         autoPlay
         playsInline
         webkit-playsinline="true"
       />
 
-      {/* Video Element */}
-      {user.videoOn && stream ? (
-        <video
-          ref={(el) => {
-            if (el && stream && el.srcObject !== stream) {
-              el.srcObject = stream;
-              el.play().catch(console.warn);
-            }
-          }}
-          autoPlay
-          playsInline
-          webkit-playsinline="true"
-          muted
-          className="w-full h-full object-cover"
-        />
-      ) : (
-        <div className="flex flex-col items-center justify-center gap-3 p-4">
+      {/* Video Element - ALWAYS MOUNTED to prevent React DOM unmount stream drops */}
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        webkit-playsinline="true"
+        muted
+        className={`w-full h-full object-cover transition-opacity duration-300 ${
+          showVideo ? 'opacity-100' : 'opacity-0 absolute pointer-events-none'
+        }`}
+      />
+
+      {/* Avatar / Loading Overlay when Video is Off or Stream Connecting */}
+      {!showVideo && (
+        <div className="flex flex-col items-center justify-center gap-3 p-4 z-10">
           <img
             src={user.avatar || `https://api.dicebear.com/7.x/bottts/svg?seed=${user.socketId}`}
             alt={user.name || 'User'}
             className="w-20 h-20 rounded-full p-1 bg-slate-900 border border-pink-500/40 shadow-lg"
           />
           <span className="text-xs text-pink-200 font-semibold">{user.name || 'Participant'}</span>
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-pink-500/20 border border-pink-500/30 text-[10px] text-pink-300">
+            <Activity className="w-3 h-3 text-pink-400 animate-spin" />
+            <span>{connState === 'connected' ? 'Camera Off' : `Connecting (${connState})...`}</span>
+          </div>
         </div>
       )}
 
-      <div className="absolute bottom-3 left-3 px-3 py-1 rounded-xl glass-panel border border-white/15 text-xs font-bold text-white flex items-center gap-1.5">
+      {/* Participant Info Overlay */}
+      <div className="absolute bottom-3 left-3 px-3 py-1 rounded-xl glass-panel border border-white/15 text-xs font-bold text-white flex items-center gap-1.5 z-20">
         <span>{user.name || 'Participant'}</span>
         <Smartphone className="w-3.5 h-3.5 text-pink-400" />
       </div>
