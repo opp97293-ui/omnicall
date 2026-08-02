@@ -36,15 +36,15 @@ export default function Room({ userConfig, onLeaveRoom }) {
   const [messages, setMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
   const [participants, setParticipants] = useState([]);
-  const [remoteStreams, setRemoteStreams] = useState(new Map()); // socketId -> MediaStream
-  const [connectionStates, setConnectionStates] = useState(new Map()); // socketId -> string
+  const [remoteStreams, setRemoteStreams] = useState(new Map());
+  const [connectionStates, setConnectionStates] = useState(new Map());
   const [mediaError, setMediaError] = useState(null);
 
   const socketRef = useRef(null);
   const localStreamRef = useRef(null);
   const localVideoRef = useRef(null);
-  const peersRef = useRef(new Map()); // socketId -> RTCPeerConnection
-  const candidateQueues = useRef(new Map()); // socketId -> RTCIceCandidate[]
+  const peersRef = useRef(new Map());
+  const candidateQueues = useRef(new Map());
 
   useEffect(() => {
     const socket = io(window.location.origin, {
@@ -52,15 +52,23 @@ export default function Room({ userConfig, onLeaveRoom }) {
     });
     socketRef.current = socket;
 
-    async function initPerfectWebRTC() {
+    async function initMobileAdaptiveWebRTC() {
       let localStream;
+      const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+      console.log('[App] Device environment:', isMobile ? 'Mobile' : 'PC Desktop');
+
+      // Native Constraints tailored for Mobile Portrait vs PC Landscape Sensors
+      const videoConstraints = isMobile
+        ? { width: { ideal: 720 }, height: { ideal: 1280 }, facingMode: 'user', frameRate: { ideal: 30 } }
+        : { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+
       try {
         localStream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+          video: videoConstraints,
           audio: { echoCancellation: true, noiseSuppression: true }
         });
       } catch (err) {
-        console.warn('Strict resolution failed, trying basic getUserMedia:', err);
+        console.warn('Adaptive constraints failed, trying basic getUserMedia:', err);
         try {
           localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         } catch (e) {
@@ -72,7 +80,11 @@ export default function Room({ userConfig, onLeaveRoom }) {
 
       localStreamRef.current = localStream;
       localStream.getAudioTracks().forEach(t => { t.enabled = initialMic; });
-      localStream.getVideoTracks().forEach(t => { t.enabled = initialVideo; });
+      localStream.getVideoTracks().forEach(t => { 
+        t.enabled = initialVideo;
+        t.onmute = () => console.warn('Mobile video track muted by OS');
+        t.onunmute = () => console.log('Mobile video track unmuted by OS');
+      });
 
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = localStream;
@@ -89,13 +101,12 @@ export default function Room({ userConfig, onLeaveRoom }) {
 
       // Handlers
       socket.on('room-users', (existingUsers) => {
-        console.log('[Socket] Room users list received:', existingUsers);
+        console.log('[Socket] Existing room users list:', existingUsers);
         setParticipants([
           { socketId: socket.id, name: userName, avatar, micOn: initialMic, videoOn: initialVideo },
           ...existingUsers
         ]);
 
-        // NEWLY JOINED USER ONLY initiates offers to existing users (Prevents Glare!)
         existingUsers.forEach(user => {
           createOfferToUser(user.socketId);
         });
@@ -104,7 +115,6 @@ export default function Room({ userConfig, onLeaveRoom }) {
       socket.on('user-joined', (newUser) => {
         console.log('[Socket] New user joined room:', newUser);
         setParticipants(prev => [...prev.filter(p => p.socketId !== newUser.socketId), newUser]);
-        // Existing user DOES NOT create offer here; waits for joining user's offer!
       });
 
       socket.on('offer', async ({ from, offer }) => {
@@ -153,7 +163,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
       });
     }
 
-    initPerfectWebRTC();
+    initMobileAdaptiveWebRTC();
 
     return () => {
       if (localStreamRef.current) {
@@ -164,7 +174,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
     };
   }, [roomId]);
 
-  // WEBRTC PEER CONNECTION CREATOR
+  // WEBRTC PEER CONNECTION CREATOR WITH MOBILE TRANSCEIVERS
   function createPeer(targetSocketId) {
     if (peersRef.current.has(targetSocketId)) {
       return peersRef.current.get(targetSocketId);
@@ -173,12 +183,16 @@ export default function Room({ userConfig, onLeaveRoom }) {
     console.log('[WebRTC] Creating RTCPeerConnection for target:', targetSocketId);
     const peer = new RTCPeerConnection(ICE_SERVERS);
 
-    // Add local tracks
-    if (localStreamRef.current) {
+    // Add local tracks & transceivers
+    if (localStreamRef.current && localStreamRef.current.getTracks().length > 0) {
       localStreamRef.current.getTracks().forEach(track => {
-        console.log('[WebRTC] Adding local track to peer:', track.kind);
+        console.log('[WebRTC] Adding track to peer:', track.kind, track.label);
         peer.addTrack(track, localStreamRef.current);
       });
+    } else {
+      console.warn('[WebRTC] Local tracks missing, adding default transceivers');
+      peer.addTransceiver('audio', { direction: 'sendrecv' });
+      peer.addTransceiver('video', { direction: 'sendrecv' });
     }
 
     peer.onicecandidate = (event) => {
@@ -190,7 +204,6 @@ export default function Room({ userConfig, onLeaveRoom }) {
       }
     };
 
-    // Return new MediaStream reference instance on every track update so React re-renders!
     peer.ontrack = (event) => {
       console.log('[WebRTC] Received remote track from:', targetSocketId, event.track.kind);
       
@@ -240,7 +253,6 @@ export default function Room({ userConfig, onLeaveRoom }) {
   async function handleReceiveOffer(fromSocketId, offerSignal) {
     const peer = createPeer(fromSocketId);
     try {
-      // If we are already in have-local-offer state, ignore duplicate offer or rollback
       if (peer.signalingState !== 'stable') {
         console.warn(`[WebRTC] Ignore offer from ${fromSocketId} because signalingState is ${peer.signalingState}`);
         return;
@@ -248,7 +260,6 @@ export default function Room({ userConfig, onLeaveRoom }) {
 
       await peer.setRemoteDescription(new RTCSessionDescription(offerSignal));
 
-      // Flush candidate queue
       if (candidateQueues.current.has(fromSocketId)) {
         const candidates = candidateQueues.current.get(fromSocketId);
         for (const candidate of candidates) {
@@ -269,7 +280,6 @@ export default function Room({ userConfig, onLeaveRoom }) {
     const peer = peersRef.current.get(fromSocketId);
     if (peer) {
       try {
-        // STRICT CHECK: Only call setRemoteDescription if state is have-local-offer (Fixes InvalidStateError!)
         if (peer.signalingState === 'have-local-offer') {
           await peer.setRemoteDescription(new RTCSessionDescription(answerSignal));
 
@@ -358,7 +368,7 @@ export default function Room({ userConfig, onLeaveRoom }) {
             <h2 className="font-bold text-white text-sm flex items-center gap-2">
               OmniCall Room <span className="px-2 py-0.5 rounded-md bg-pink-500/20 text-pink-300 font-mono text-xs border border-pink-500/30">{roomId}</span>
             </h2>
-            <p className="text-[10px] text-pink-200/70">Native WebRTC • Glare-Free Perfect Signaling</p>
+            <p className="text-[10px] text-pink-200/70">Mobile ↔ PC Dual Camera Sync</p>
           </div>
         </div>
 
@@ -554,7 +564,8 @@ function NativeVideoTile({ user, stream, connState }) {
   useEffect(() => {
     if (stream) {
       const vTracks = stream.getVideoTracks();
-      setHasVideoTrack(vTracks.length > 0 && vTracks.some(t => t.enabled));
+      const hasActiveVideo = vTracks.length > 0 && vTracks.some(t => t.readyState === 'live');
+      setHasVideoTrack(hasActiveVideo);
 
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
