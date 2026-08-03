@@ -9,13 +9,14 @@
     "lint": "eslint .",
     "preview": "node ./node_modules/vite/bin/vite.js preview",
     "server": "node server.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test --test-timeout=20000 test/protocol.test.mjs",
+    "tunnel": "node start-tunnel.js"
   },
   "dependencies": {
     "express": "^4.19.2",
     "localtunnel": "^2.0.2",
     "lucide-react": "^0.395.0",
-    "peerjs": "^1.5.4",
     "qrcode.react": "^3.1.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
